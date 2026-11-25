@@ -190,7 +190,7 @@ def summarize(sentences: list[str], length: str = "medium",
     elapsed = time.perf_counter() - started
     return ExtractiveResult(
         summary_text=summary_text,
-        method="textrank",
+        method="extractive",
         length=length,
         selected=selected,
         sentences=scored,
