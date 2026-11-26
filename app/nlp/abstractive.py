@@ -21,11 +21,16 @@ logger = get_logger(__name__)
 
 ProgressFn = Callable[[int, str, str], None]
 
-GENERATION_PRESETS: dict[str, dict[str, int | float]] = {
-    "short": {"max_length": 150, "min_length": 45, "length_penalty": 2.0},
-    "medium": {"max_length": 260, "min_length": 80, "length_penalty": 2.0},
-    "long": {"max_length": 420, "min_length": 120, "length_penalty": 1.8},
+GENERATION_PRESETS: dict[str, dict[str, float | int]] = {
+    # ratio = target summary words per input word. The absolute caps keep a
+    # single chunk from producing an essay; the ratio keeps a short chunk from
+    # being padded out with invented content.
+    "short": {"max_length": 160, "min_length": 35, "length_penalty": 2.0, "ratio": 0.22},
+    "medium": {"max_length": 280, "min_length": 60, "length_penalty": 2.0, "ratio": 0.28},
+    "long": {"max_length": 440, "min_length": 90, "length_penalty": 1.8, "ratio": 0.34},
 }
+
+_NUMBER = re.compile(r"\b\d+(?:[.,]\d+)?%?\b")
 
 
 class ModelUnavailableError(RuntimeError):
@@ -248,12 +253,19 @@ class AbstractiveSummarizer:
 
         assert self._model is not None and self._tokenizer is not None
         preset = GENERATION_PRESETS.get(length, GENERATION_PRESETS["medium"])
-        beams = 2 if self._info and self._info.device == "cpu" else 4
+        beams = max(1, settings.bart_num_beams)
         batch_size = max(1, min(settings.summary_batch_size, len(texts)))
         outputs: list[str] = []
 
         for start in range(0, len(texts), batch_size):
             batch = texts[start:start + batch_size]
+            # Scale the output window to this batch's shortest input so small
+            # chunks cannot be padded into hallucinated paragraphs.
+            shortest = max(1, min(len(text.split()) for text in batch))
+            target = int(shortest * float(preset["ratio"]))
+            max_length = max(int(preset["min_length"]) + 8,
+                             min(int(preset["max_length"]), target))
+            min_length = min(int(preset["min_length"]), max(12, max_length - 10))
             try:
                 encoded = self._tokenizer(
                     batch,
@@ -267,10 +279,11 @@ class AbstractiveSummarizer:
                     generated = self._model.generate(
                         **encoded,
                         num_beams=beams,
-                        max_length=int(preset["max_length"]),
-                        min_length=int(preset["min_length"]),
+                        max_length=max_length,
+                        min_length=min_length,
                         length_penalty=float(preset["length_penalty"]),
                         no_repeat_ngram_size=3,
+                        repetition_penalty=1.05,
                         early_stopping=True,
                     )
                 decoded = self._tokenizer.batch_decode(generated, skip_special_tokens=True)
@@ -302,7 +315,41 @@ class AbstractiveSummarizer:
         words = summary.lower().split()
         if len(words) > 12 and len(set(words)) / len(words) < 0.35:
             return False
+        # Reject output that is essentially the whole chunk copied back.
+        source_words = len(source.split())
+        if source_words >= 20 and len(words) > source_words * 0.9:
+            return False
         return True
+
+    @classmethod
+    def _drop_unsupported_numbers(cls, text: str, source: str) -> tuple[str, list[str]]:
+        """Remove generated sentences that introduce numbers absent from the source.
+
+        Numbers (dates, percentages, parameter counts) are cheap to verify and are
+        a common hallucination. Dropping such a sentence is safer than keeping an
+        invented fact; if every sentence is unsupported we keep the text and warn.
+        """
+        source_numbers = set(_NUMBER.findall(source))
+        sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", text) if s.strip()]
+        if len(sentences) <= 1:
+            return text, []
+        kept: list[str] = []
+        dropped = 0
+        for sentence in sentences:
+            introduced = set(_NUMBER.findall(sentence)) - source_numbers
+            if introduced:
+                dropped += 1
+            else:
+                kept.append(sentence)
+        if not kept:
+            return text, []
+        warnings = []
+        if dropped:
+            warnings.append(
+                f"Removed {dropped} generated sentence(s) containing numbers that do not "
+                "appear in the source text."
+            )
+        return " ".join(kept), warnings
 
     def _summarise_chunks(self, chunk_texts: list[str], length: str,
                           progress: ProgressFn | None) -> tuple[list[str], list[str]]:
@@ -330,6 +377,8 @@ class AbstractiveSummarizer:
                                 "fell back to its lead sentences.")
                 out = " ".join(re.split(r"(?<=[.!?])\s+", chunk)[:2]).strip()
             if out:
+                out, number_warnings = self._drop_unsupported_numbers(out, chunk)
+                warnings.extend(number_warnings)
                 summaries.append(out)
         return summaries, warnings
 
@@ -425,6 +474,10 @@ class AbstractiveSummarizer:
         final_text, reduce_warnings = self._reduce(chunk_summaries, length, progress)
         warnings.extend(reduce_warnings)
         final_text = self._clean(final_text)
+        final_text, number_warnings = self._drop_unsupported_numbers(
+            final_text, " ".join(sentences)
+        )
+        warnings.extend(number_warnings)
 
         if progress:
             progress(95, "finalizing", "Finalising summary")

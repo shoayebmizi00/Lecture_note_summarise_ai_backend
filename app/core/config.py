@@ -69,6 +69,8 @@ class Settings(BaseSettings):
     chunk_overlap_sentences: int = 1
     abstractive_max_chunks: int = 30
     summary_batch_size: int = 4
+    bart_num_beams: int = 4  # beam search width; 4 is noticeably better than greedy
+    extractive_mmr_lambda: float = 0.65  # relevance vs. redundancy trade-off
 
     # --- optional semantic keywords -------------------------------------
     enable_keybert: bool = False

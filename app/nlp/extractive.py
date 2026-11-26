@@ -10,6 +10,7 @@ import numpy as np
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
+from app.core.config import settings
 from app.core.logging import get_logger
 
 logger = get_logger(__name__)
@@ -84,6 +85,7 @@ def similarity_matrix(sentences: list[str]) -> np.ndarray:
             stop_words="english",
             ngram_range=(1, 2),
             sublinear_tf=True,
+            max_df=0.90,
             token_pattern=r"(?u)\b\w[\w'-]{1,}\b",
         )
         matrix = vectorizer.fit_transform(sentences)
@@ -123,11 +125,41 @@ def textrank_scores(sentences: list[str], sim: np.ndarray | None = None,
     return scores / max_score
 
 
+def _mmr_select(scores: np.ndarray, sim: np.ndarray, target: int,
+                lambda_: float) -> list[int]:
+    """Maximal Marginal Relevance: relevance to the document minus redundancy.
+
+    Pure top-k PageRank often returns several near-identical sentences. MMR picks
+    the next sentence that is both central and different from what is already in
+    the summary, which improves coverage (and ROUGE recall in practice).
+    """
+    n = len(scores)
+    if target >= n:
+        return list(range(n))
+    selected: list[int] = []
+    remaining = list(range(n))
+    while len(selected) < target and remaining:
+        best_idx = remaining[0]
+        best_value = float("-inf")
+        for idx in remaining:
+            redundancy = 0.0
+            if selected and sim.size:
+                redundancy = float(max(sim[idx, chosen] for chosen in selected))
+            value = lambda_ * float(scores[idx]) - (1.0 - lambda_) * redundancy
+            if value > best_value:
+                best_value = value
+                best_idx = idx
+        selected.append(best_idx)
+        remaining.remove(best_idx)
+    return sorted(selected)
+
+
 def summarize(sentences: list[str], length: str = "medium",
               *, min_sentences: int | None = None,
               max_sentences: int | None = None,
-              redundancy_threshold: float = REDUNDANCY_THRESHOLD) -> ExtractiveResult:
-    """Rank sentences with TextRank, pick the top-k, restore document order."""
+              redundancy_threshold: float = REDUNDANCY_THRESHOLD,
+              use_mmr: bool = True) -> ExtractiveResult:
+    """Rank sentences with TextRank, pick the top-k with MMR, restore document order."""
     started = time.perf_counter()
     length = (length or "medium").lower()
     if length not in LENGTH_PRESETS:
@@ -155,26 +187,25 @@ def summarize(sentences: list[str], length: str = "medium",
     sim = similarity_matrix(sentences)
     scores = textrank_scores(sentences, sim)
 
-    ranked = np.argsort(-scores)
-    selected_idx: list[int] = []
-    for idx in ranked:
-        if len(selected_idx) >= target:
-            break
-        candidate_vec = sim[idx] if sim.size else None
-        redundant = False
-        if candidate_vec is not None:
-            for chosen in selected_idx:
-                if candidate_vec[chosen] >= redundancy_threshold:
-                    redundant = True
-                    break
-        if redundant and len(ranked) - len(selected_idx) > target:
-            continue
-        selected_idx.append(int(idx))
+    if use_mmr:
+        selected_idx = _mmr_select(scores, sim, target, settings.extractive_mmr_lambda)
+    else:
+        ranked = np.argsort(-scores)
+        selected_idx = []
+        for idx in ranked:
+            if len(selected_idx) >= target:
+                break
+            redundant = False
+            if selected_idx and sim.size:
+                redundant = any(sim[idx, chosen] >= redundancy_threshold for chosen in selected_idx)
+            if redundant and len(ranked) - len(selected_idx) > target:
+                continue
+            selected_idx.append(int(idx))
+        selected_idx.sort()
 
     if not selected_idx:
-        selected_idx = [int(i) for i in ranked[:target]]
-
-    selected_idx.sort()  # restore original document order
+        selected_idx = [int(i) for i in np.argsort(-scores)[:target]]
+        selected_idx.sort()
     selected_set = set(selected_idx)
 
     scored = [

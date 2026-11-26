@@ -28,6 +28,17 @@ _URL = re.compile(r"https?://\S+|www\.\S+")
 _EMAIL = re.compile(r"\b[\w.+-]+@[\w-]+\.[\w.]+\b")
 _PAGE_JUNK = re.compile(r"^\s*(?:page\s*)?\d{1,4}\s*(?:of\s*\d{1,4})?\s*$", re.IGNORECASE)
 _SPACED_OUT = re.compile(r"\b(?:\w\s){4,}\w\b")  # "T h e   c a t"
+_CODE_HINT = re.compile(
+    r"(?:^|\s)(?:import|from)\s+[A-Za-z_]|\bdef\s+\w+\s*\(|\bclass\s+\w+\s*[:(]|"
+    r"\bprint\s*\(|>>>|->|::|\u2192|\bfor\s+\w+\s+in\s+|"
+    r"\b\w+\s*=\s*[A-Za-z_][\w.]*\s*\(|\b\w+\s*=\s*[\[{(\"']",
+    re.IGNORECASE,
+)
+_POS_TAG = re.compile(r"\b[A-Za-z][\w'-]*/[A-Z$]{1,6}\b")
+_PARSE_TREE = re.compile(r"\(\s*[A-Z$]{1,5}\s")
+_GRAMMAR_RULE = re.compile(r"\b[A-Z]{1,4}:\s+[A-Z][A-Za-z]*\b")
+_CODE_SYMBOLS = re.compile(r"[(){}\[\]<>=|\\/*#^~]")
+_NON_LATIN = re.compile(r"[^\x00-\x7f\u00c0-\u024f\u2000-\u206f]")
 
 _ABBREVIATIONS = {
     "e.g", "i.e", "etc", "vs", "fig", "figs", "eq", "eqs", "no", "vol", "ch", "sec",
@@ -62,6 +73,35 @@ def ensure_nltk() -> bool:
     return _nltk_ready
 
 
+def _merge_block_lines(lines: list[str]) -> str:
+    """Join PDF line wraps but keep slide bullets / headings on their own line.
+
+    A wrapped prose line usually ends in a lowercase word, a comma or an opening
+    bracket. A slide bullet or heading usually ends in a capitalised word without
+    terminal punctuation and is short. Keeping those as separate lines stops a
+    whole slide being glued into one 200-word pseudo-sentence.
+    """
+    merged = ""
+    for raw in lines:
+        line = raw.strip()
+        if not line:
+            continue
+        if not merged:
+            merged = line
+            continue
+        previous = merged.rsplit("\n", 1)[-1]
+        if previous.endswith((",", ";", ":", "-", "\u2013", "\u2014", "(", "/")):
+            merged = f"{merged} {line}"
+        elif len(previous) >= 60 and not re.search(r"[.!?]$", previous):
+            # Long line without a terminator: almost certainly a wrapped sentence.
+            merged = f"{merged} {line}"
+        elif line[:1].islower() and len(previous) >= 40:
+            merged = f"{merged} {line}"
+        else:
+            merged = f"{merged}\n{line}"
+    return re.sub(r"[ \t]+", " ", merged).strip()
+
+
 def normalize_text(text: str) -> str:
     if not text:
         return ""
@@ -91,8 +131,7 @@ def normalize_text(text: str) -> str:
     paragraphs = [p for p in text.split("\n\n") if p.strip()]
     joined = []
     for para in paragraphs:
-        merged = " ".join(line for line in para.split("\n") if line.strip())
-        merged = re.sub(r"\s+", " ", merged).strip()
+        merged = _merge_block_lines(para.split("\n"))
         if merged:
             joined.append(merged)
     text = "\n\n".join(joined)
@@ -108,19 +147,29 @@ def _regex_split(text: str) -> list[str]:
 
 
 def split_sentences(text: str) -> list[str]:
-    """Sentence segmentation that tolerates abbreviations, decimals and formulas."""
+    """Sentence segmentation that tolerates abbreviations, decimals and formulas.
+
+    Lines that survived ``normalize_text`` as separate units (slide bullets,
+    headings) are tokenised independently, so two bullets are never merged into
+    one sentence just because neither ends with a full stop.
+    """
     text = text.strip()
     if not text:
         return []
-    if ensure_nltk():
-        try:
-            from nltk.tokenize import sent_tokenize
 
-            pieces = sent_tokenize(text, language="english")
-        except Exception:
-            pieces = _regex_split(text)
-    else:
-        pieces = _regex_split(text)
+    pieces: list[str] = []
+    for block in (part.strip() for part in text.split("\n")):
+        if not block:
+            continue
+        if ensure_nltk():
+            try:
+                from nltk.tokenize import sent_tokenize
+
+                pieces.extend(sent_tokenize(block, language="english"))
+                continue
+            except Exception:
+                pass
+        pieces.extend(_regex_split(block))
 
     # NLTK sometimes splits after "e.g." / "Fig." - repair obvious cases.
     repaired: list[str] = []
@@ -129,9 +178,9 @@ def split_sentences(text: str) -> list[str]:
         if not piece:
             continue
         if repaired:
-            last_word = re.split(r"[\s(]", repaired[-1])[-2].lower().strip(".,;:()")
-            prev_ends_abbrev = re.search(r"\b([A-Za-z]{1,5})\.$", repaired[-1]) is not None
-            if prev_ends_abbrev and last_word in _ABBREVIATIONS:
+            tail = re.search(r"([A-Za-z]{1,5}(?:\.[A-Za-z]{1,5})*)\.$", repaired[-1])
+            prev_ends_abbrev = tail is not None
+            if prev_ends_abbrev and tail.group(1).lower() in _ABBREVIATIONS:
                 repaired[-1] = f"{repaired[-1]} {piece}"
                 continue
             if repaired[-1].endswith(("Fig.", "Eq.", "No.", "vs.")):
@@ -150,6 +199,28 @@ def _token_set(sentence: str) -> set[str]:
     return {w for w in re.findall(r"[a-z0-9]+", sentence.lower()) if len(w) > 2}
 
 
+def is_code_like(text: str) -> bool:
+    """Detect code, grammar rules and parse trees extracted from slide decks.
+
+    These are real content in a lecture PDF but they make terrible summary
+    sentences (``(S (NP (DT The) (NN cat)) ...)``), so they are excluded from
+    candidate sentences while staying in the stored extracted text.
+    """
+    if _CODE_HINT.search(text):
+        return True
+    if len(_POS_TAG.findall(text)) >= 3:
+        return True
+    if len(_PARSE_TREE.findall(text)) >= 2:
+        return True
+    if len(_GRAMMAR_RULE.findall(text)) >= 3:
+        return True
+    if len(text) >= 30:
+        symbols = len(_CODE_SYMBOLS.findall(text))
+        if symbols / len(text) > 0.12:
+            return True
+    return False
+
+
 def is_noise(sentence: str) -> bool:
     stripped = sentence.strip()
     if len(stripped) < 20:
@@ -162,6 +233,10 @@ def is_noise(sentence: str) -> bool:
             return True
     letters = sum(ch.isalpha() for ch in stripped)
     if letters < len(stripped) * 0.35:
+        return True
+    # This is an English-language summariser; foreign-script example lines from
+    # translation slides are not useful summary content.
+    if len(_NON_LATIN.findall(stripped)) >= 3:
         return True
     if len(set(stripped.lower().split())) <= 1 and len(stripped) < 80:
         return True
@@ -205,6 +280,9 @@ def preprocess(text: str) -> PreprocessedDocument:
 
     for sentence in raw_sentences:
         if is_noise(sentence):
+            noise_removed += 1
+            continue
+        if is_code_like(sentence):
             noise_removed += 1
             continue
         key = _sentence_key(sentence)

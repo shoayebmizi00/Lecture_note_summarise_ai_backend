@@ -198,14 +198,19 @@ def _page_text(page: "fitz.Page") -> str:
             cleaned = _clean_page_text(raw)
             if not cleaned:
                 continue
+            previous = parts[-1] if parts else ""
+            continues = bool(previous) and (
+                previous.endswith((",", ";", ":", "-", "\u2013", "\u2014", "(", "/"))
+                or (len(previous) >= 60 and not _SENTENCE_TAIL.search(previous))
+            )
             if (
-                parts
-                and not _SENTENCE_TAIL.search(parts[-1])
-                and not _probable_heading(parts[-1])
+                continues
+                and not _probable_heading(previous)
                 and not _probable_heading(cleaned)
+                and (cleaned[:1].islower() or len(previous) >= 60)
             ):
-                # A paragraph was split across blocks: stitch the sentence back.
-                parts[-1] = f"{parts[-1]} {cleaned}"
+                # A prose paragraph was split across blocks: stitch the sentence back.
+                parts[-1] = f"{previous} {cleaned}"
             else:
                 parts.append(cleaned)
         if parts:
